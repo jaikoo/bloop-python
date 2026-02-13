@@ -25,5 +25,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/bloop"
-Documentation = "https://github.com/your-org/bloop/tree/main/sdks/python"
+Homepage = "https://github.com/jaikoo/bloop-python"
+Repository = "https://github.com/jaikoo/bloop-python"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bloop"]
