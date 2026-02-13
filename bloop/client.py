@@ -1,10 +1,12 @@
 """Bloop error reporting client for Python."""
 
+import atexit
 import hashlib
 import hmac
 import json
 import sys
 import threading
+import traceback
 import urllib.request
 from typing import Any, Optional
 
@@ -45,25 +47,65 @@ class BloopClient:
         self._closed = False
         self._timer: Optional[threading.Timer] = None
         self._original_excepthook = sys.excepthook
+        self._original_threading_excepthook: Any = None
 
         if auto_capture:
             self._install_excepthook()
 
         self._schedule_flush()
+        atexit.register(self.close)
 
     def _install_excepthook(self) -> None:
         original = sys.excepthook
 
         def hook(exc_type, exc_value, exc_tb):
-            self.capture(
-                error_type=exc_type.__name__,
-                message=str(exc_value),
-                source="python",
-            )
+            self.capture_exception(exc_value, exc_tb=exc_tb)
             self.flush()
             original(exc_type, exc_value, exc_tb)
 
         sys.excepthook = hook
+
+        # Hook threading.excepthook for crashes in spawned threads (Python 3.8+)
+        if hasattr(threading, "excepthook"):
+            self._original_threading_excepthook = threading.excepthook
+
+            def thread_hook(args):
+                self.capture_exception(args.exc_value, exc_tb=args.exc_traceback)
+                self.flush()
+                if self._original_threading_excepthook:
+                    self._original_threading_excepthook(args)
+
+            threading.excepthook = thread_hook
+
+    def capture_exception(
+        self,
+        exc: BaseException,
+        *,
+        exc_tb: Any = None,
+        source: str = "python",
+        route_or_procedure: str = "",
+        screen: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Capture a Python exception with full traceback.
+
+        Args:
+            exc: The exception to capture.
+            exc_tb: Optional traceback object. If not provided, uses exc.__traceback__.
+        """
+        tb = exc_tb or exc.__traceback__
+        stack = "".join(traceback.format_exception(type(exc), exc, tb))
+        self.capture(
+            error_type=type(exc).__name__,
+            message=str(exc),
+            source=source,
+            stack=stack,
+            route_or_procedure=route_or_procedure,
+            screen=screen,
+            metadata=metadata,
+            **kwargs,
+        )
 
     def capture(
         self,
@@ -180,6 +222,9 @@ class BloopClient:
             self._timer.cancel()
         self.flush()
         sys.excepthook = self._original_excepthook
+        if self._original_threading_excepthook is not None and hasattr(threading, "excepthook"):
+            threading.excepthook = self._original_threading_excepthook
+        atexit.unregister(self.close)
 
     def __enter__(self) -> "BloopClient":
         return self
