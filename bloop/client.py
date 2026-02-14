@@ -43,6 +43,8 @@ class BloopClient:
         self.release = release
 
         self._buffer: list[dict[str, Any]] = []
+        self._trace_buffer: list[dict[str, Any]] = []
+        self._custom_model_costs: dict[str, dict[str, float]] = {}
         self._lock = threading.Lock()
         self._closed = False
         self._timer: Optional[threading.Timer] = None
@@ -153,10 +155,106 @@ class BloopClient:
             if len(self._buffer) >= self.max_buffer_size:
                 self._flush_locked()
 
+    def start_trace(
+        self,
+        name: str,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        input: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        prompt_name: Optional[str] = None,
+        prompt_version: Optional[str] = None,
+    ) -> "Trace":
+        """Create a new LLM trace. Call trace.end() when done."""
+        from bloop.tracing import Trace
+
+        return Trace(
+            client=self,
+            name=name,
+            session_id=session_id,
+            user_id=user_id,
+            input=input,
+            metadata=metadata,
+            prompt_name=prompt_name,
+            prompt_version=prompt_version,
+        )
+
+    def trace(self, name: str, **kwargs: Any) -> "Trace":
+        """Alias for start_trace, usable as context manager."""
+        return self.start_trace(name, **kwargs)
+
+    def wrap_openai(self, client: Any) -> Any:
+        """Wrap an OpenAI-compatible client for automatic LLM tracing.
+
+        Works with any OpenAI-compatible provider (OpenAI, Minimax, Kimi, etc.).
+        Provider is auto-detected from the client's base_url.
+        """
+        from bloop.integrations.openai import wrap_openai_client
+
+        return wrap_openai_client(self, client)
+
+    def wrap_anthropic(self, client: Any) -> Any:
+        """Wrap an Anthropic client for automatic LLM tracing."""
+        from bloop.integrations.anthropic import wrap_anthropic_client
+
+        return wrap_anthropic_client(self, client)
+
+    def set_model_costs(self, model: str, costs: dict[str, float]) -> None:
+        """Override or add custom model pricing.
+
+        Args:
+            model: Model name (e.g. "my-fine-tune")
+            costs: Dict with "input" and "output" keys (per-token cost in dollars)
+        """
+        self._custom_model_costs[model] = costs
+
+    def _enqueue_trace(self, trace: Any) -> None:
+        """Called by Trace.end() to push completed trace to buffer."""
+        with self._lock:
+            self._trace_buffer.append(trace.to_dict())
+            if len(self._trace_buffer) >= self.max_buffer_size:
+                self._flush_traces_locked()
+
+    def _flush_traces_locked(self) -> None:
+        """Flush trace buffer while holding the lock."""
+        if not self._trace_buffer:
+            return
+        traces = self._trace_buffer[:]
+        self._trace_buffer.clear()
+        thread = threading.Thread(target=self._send_traces, args=(traces,), daemon=True)
+        thread.start()
+
+    def _send_traces(self, traces: list[dict[str, Any]]) -> None:
+        """Send traces to the bloop server in batches of 50."""
+        for i in range(0, len(traces), 50):
+            batch = traces[i : i + 50]
+            body = json.dumps({"traces": batch}).encode("utf-8")
+            signature = hmac.new(
+                self.project_key.encode("utf-8"),
+                body,
+                hashlib.sha256,
+            ).hexdigest()
+            req = urllib.request.Request(
+                f"{self.endpoint}/v1/traces/batch",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Signature": signature,
+                    "X-Project-Key": self.project_key,
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    resp.read()
+            except Exception:
+                pass  # Fire and forget
+
     def flush(self) -> None:
-        """Send all buffered events immediately."""
+        """Send all buffered events and traces immediately."""
         with self._lock:
             self._flush_locked()
+            self._flush_traces_locked()
 
     def _flush_locked(self) -> None:
         """Flush buffer while holding the lock."""
